@@ -1,300 +1,350 @@
 import torch
-import time, os
+import os
 import numpy as np
 from simulator import Manufacturing_Simulator
-from agent import AgentPool
-from config import config, SELLER, BUYER, TRANSFORM, stages
-from logging import getLogger
-from utils import AverageMeter
-
+from agent import PPOAgent, OptimalFollowerValueEstimator
+from config import config, LEADER, BUYER, TRANSFORM, stages
 from torch.utils.tensorboard import SummaryWriter
-from utils import get_result_folder
+from logging import getLogger
+from utils import AverageMeter, get_result_folder
 
-class Trainer:
-    """
-    The trainer class for the manufacturing problem
+class RunningMeanStd:
+    def __init__(self, shape):
+        self.mean = np.zeros(shape, dtype=np.float32)
+        self.var = np.ones(shape, dtype=np.float32)
+        self.count = 1e-4
 
-    Attributes:
-    num_agents - the number of agents (institutions) in the problem
-    num_commodities - number of commodities in the problem
-    episode_length - the maximum timesteps for every episode
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+        
+        if x.ndim == 1:
+            x = np.expand_dims(x, axis=0)
+            batch_mean = x[0]
+            batch_var = np.zeros_like(batch_mean)
+            batch_count = 1
+            
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
 
-    Functoins:
-    rollout - collect trajectories for training
-    learn - train the agents
-    """
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+        
+    def normalize(self, x):
+        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+
+class BilevelTrainer:
     def __init__(self):
         for key, value in config.items():
-            # print(key, value)
             setattr(self, key, value)
 
         self.env = Manufacturing_Simulator()
-        self.agent_pool = AgentPool(self.num_agents, self.num_commodities, self.history_length)
-        if self.seed != None:
-            # Check if our seed is valid first
-            assert(type(self.seed) == int)
-            # Set the seed
-            torch.manual_seed(self.seed)
-            print(f"Successfully set seed to {self.seed}")
-
-        self.logger = getLogger(name='trainer')
-        log_folder = get_result_folder() + '/log'
-        global debug_folder
-        debug_folder = get_result_folder() + '/debug'
+        
+        # --- ISOLATE WORKSPACE OUTPUT TO THE DUPLICATE MARL RUN ---
+        self.result_folder = './result/bilevel_ppo_marl'
+        self.debug_folder = self.result_folder + '/debug'
+        log_folder = self.result_folder + '/log'
+        
         os.makedirs(log_folder, exist_ok=True)
-        os.makedirs(debug_folder, exist_ok=True)
+        os.makedirs(self.debug_folder, exist_ok=True)
         self.writer = SummaryWriter(log_folder)
-        # self.logger = {
-        #     'delta_t': time.time_ns(),
-        #     't_so_far': 0,   # timesteps so far
-        #     'i_so_far': 0,   # iterations so far
-        #     'batch_lens': [],# episodic lengths in batch
-        #     'batch_rews': [],# episodic returns in batch
-        #     'actor_losses': [[] for i in range(self.num_agents)],     # losses of actor network in current iteration
-        #     "avg_batch_rews": [[] for i in range(self.num_agents)] ,    # avg episodic returns in batch
-        #     "avg_actor_losses": [[] for i in range(self.num_agents)]    # avg losses of actor network in current iteration
-        # }
 
-    ## The three types agents make decisions in the simulator together and get their own observations
-    ## Need to restore the information separately
+        self.seller_obs_dim = self.num_commodities * self.history_length * (6 + self.num_agents * 8) + 2 * self.num_commodities 
+        self.buyer_obs_dim = self.seller_obs_dim + self.num_commodities + 2 * self.num_commodities * self.num_agents 
+        self.trans_obs_dim = self.buyer_obs_dim + self.num_commodities * (4 * self.num_agents + 3) 
+        
+        self.buyer_act_dim = 2 * self.num_commodities * (self.num_agents - 1) + self.num_commodities 
+        self.trans_act_dim = 2 * self.num_commodities 
+        self.leader_act_dim = 3  
+        self.leader_obs_dim = self.num_commodities + 2 
+
+        self.leader_agent = PPOAgent(
+            self.leader_obs_dim, self.leader_act_dim, f"{self.result_folder}/chpkt/leader", 
+            lr=self.lr_leader, min_val=0.1, max_val=10.0
+        )
+        
+        self.best_response_estimators = [
+            OptimalFollowerValueEstimator(self.leader_act_dim + self.buyer_obs_dim)
+            for _ in range(self.num_agents)
+        ]
+        
+        self.buyer_agents = [
+            PPOAgent(
+                self.buyer_obs_dim, self.buyer_act_dim, f"{self.result_folder}/chpkt/buyer_{ag}", 
+                lr=self.lr_follower, min_val=0.01, max_val=100.0
+            ) for ag in range(self.num_agents)
+        ]
+        self.trans_agents = [
+            PPOAgent(
+                self.trans_obs_dim, self.trans_act_dim, f"{self.result_folder}/chpkt/trans_{ag}", 
+                lr=self.lr_follower, min_val=0.01, max_val=100.0
+            ) for ag in range(self.num_agents)
+        ]
+
+        self.leader_rms = RunningMeanStd(shape=(self.leader_obs_dim,))
+        self.buyer_rms = RunningMeanStd(shape=(self.num_agents, self.buyer_obs_dim))
+        self.trans_rms = RunningMeanStd(shape=(self.num_agents, self.trans_obs_dim))
+
     def rollout(self):
-        # Let the following information be a list of three elements and each element can be the tensors for
-        # seller, buyer, and transformation
-        batch_obs = [[] for _ in range(len(stages))]            # batch observations. 
-        batch_log_probs = [[] for _ in range(len(stages))]     # log probs of each action
-        batch_acts = [[] for _ in range(len(stages))]           # batch actions
-        batch_rews = [[] for _ in range(len(stages))]           # batch rewards
-        batch_rtgs = [[] for _ in range(len(stages))]           # batch rewards-to-go
-        batch_lens = []           # episodic lengths in batch
+        batch_obs = [[] for _ in stages]
+        batch_acts = [[] for _ in stages]
+        batch_log_probs = [[] for _ in stages]
+        batch_rews = [[] for _ in stages]
+        batch_active_phi = []  
+        batch_lens = []
 
-        t = 0 # Keeps track of how many timesteps we've run so far this batch+
-
-        while t < self.num_steps: # self.num_steps # 10000
-            # Episodic data. Keeps track of rewards per episode, will get cleared
-            # upon each new episode
-            ep_rews = [[] for _ in range(len(stages))]
-            obs_s = self.env.reset()
-            # Shape: seller observations - (n_agents, seller_state_size)
+        t = 0
+        while t < self.num_steps:
+            ep_rews = [[] for _ in stages]
+            s_leader, s_follower = self.env.reset()
             done = False
-            # print(self.episode_length)
-            for ep_t in range(self.episode_length): # 500
+            
+            for ep_t in range(self.episode_length):
                 t += 1
-                #==================Collect seller data==================
-                # Collect seller observation
-                # Append the seller_obs to the proper slot
-                batch_obs[SELLER].append(obs_s)
+                batch_obs[LEADER].append(s_leader)
+                
+                self.leader_rms.update(s_leader)
+                s_leader_norm = self.leader_rms.normalize(s_leader)
+                
+                phi_bounded, raw_phi, log_p_leader = self.leader_agent.get_action(s_leader_norm)
+                batch_acts[LEADER].append(raw_phi)  
+                batch_log_probs[LEADER].append(log_p_leader)
+                
+                s_follower = self.env.step_sell(phi_bounded)  
+                batch_active_phi.append(self.env.active_phi)
+                s_buyer = self.env.get_buyer_state(s_follower)
 
-                # Get seller action
-                action_s, log_prob_s = self.agent_pool.get_actions(obs_s, SELLER)
-                # Shape: (num_sellers, seller_action_size)
-                # print("4", action_s)
+                batch_obs[BUYER].append(s_buyer)
+                self.buyer_rms.update(s_buyer)
+                s_buyer_norm = self.buyer_rms.normalize(s_buyer)
+                
+                buyer_actions = []
+                buyer_raw_actions = []
+                log_p_buyers = []
+                for ag in range(self.num_agents):
+                    act_b_bounded, raw_b_act, log_p_b = self.buyer_agents[ag].get_action(s_buyer_norm[ag])
+                    buyer_actions.append(act_b_bounded)
+                    buyer_raw_actions.append(raw_b_act)
+                    log_p_buyers.append(log_p_b)
+                
+                buyer_actions = np.array(buyer_actions)
+                buyer_raw_actions = np.array(buyer_raw_actions)
+                batch_acts[BUYER].append(buyer_raw_actions)  
+                batch_log_probs[BUYER].append(log_p_buyers)
 
-                # Send seller action and get buyer observation
-                # obs_b, rew_s = self.env.step_sell(obs_s, action_s)
-                obs_b = self.env.step_sell(obs_s, action_s)
-                # Collect seller reward, action, and log prob
-                # ep_rews[SELLER].append(rew_s)
-                batch_acts[SELLER].append(action_s)
-                batch_log_probs[SELLER].append(log_prob_s)
+                rew_b = self.env.step_buy(buyer_actions)
+                s_trans = self.env.get_trans_state(s_buyer)
 
-                #==================Collect buyer data==================
-                # Collect buyer observation
-                batch_obs[BUYER].append(obs_b)
+                batch_obs[TRANSFORM].append(s_trans)
+                self.trans_rms.update(s_trans)
+                s_trans_norm = self.trans_rms.normalize(s_trans)
+                
+                trans_actions = []
+                trans_raw_actions = []
+                log_p_trans = []
+                for ag in range(self.num_agents):
+                    act_t_bounded, raw_t_act, log_p_t = self.trans_agents[ag].get_action(s_trans_norm[ag])
+                    trans_actions.append(act_t_bounded)
+                    trans_raw_actions.append(raw_t_act)
+                    log_p_trans.append(log_p_t)
+                
+                trans_actions = np.array(trans_actions)
+                trans_raw_actions = np.array(trans_raw_actions)
+                batch_acts[TRANSFORM].append(trans_raw_actions)
+                batch_log_probs[TRANSFORM].append(log_p_trans)
 
-                # Get buyer action
-                action_b, log_prob_b = self.agent_pool.get_actions(obs_b, BUYER)
-                # Shape: (num_buyers, buyer_action_size)
-                # print("5", action_b)
-
-                # Send buyer action and get transformation observation
-                obs_t, rew_b, rew_s = self.env.step_buy(obs_b, action_b)
-
-                # Collect buyer reward, action, and log prob
-                ep_rews[SELLER].append(rew_s)
+                s_leader, s_follower, rew_t, rew_l, done = self.env.step_trans(trans_actions)
+                
+                ep_rews[LEADER].append(rew_l)
                 ep_rews[BUYER].append(rew_b)
-                batch_acts[BUYER].append(action_b)
-                batch_log_probs[BUYER].append(log_prob_b)
-
-                #==================Collect transform data==================
-                # Collect transformtion observation
-                batch_obs[TRANSFORM].append(obs_t)
-
-                # Get transformation action
-                action_t, log_prob_t = self.agent_pool.get_actions(obs_t, TRANSFORM)
-                #import pdb; pdb.set_trace()
-                # Shape: (num_transformers, transformer_action_size)
-                # print("6", action_t)
-                if np.isnan(action_t[0][0]):
-                    raise NotImplementedError 
-
-                # Send transformation action and get seller observation
-                obs_s, rew_t, done_t = self.env.step_trans(obs_t, action_t)
-
-                # Collect transform reward, action, and log prob
                 ep_rews[TRANSFORM].append(rew_t)
-                batch_acts[TRANSFORM].append(action_t)
-                batch_log_probs[TRANSFORM].append(log_prob_t)
 
-                ## TODO-Check early termination condition
-                #if done:
-                #    break
-
-                # Collect episodic length and rewards
-            batch_lens.append(ep_t + 1) # plus 1 because timestep starts at 0
+            batch_lens.append(ep_t + 1) 
             for stage in stages:
                 batch_rews[stage].append(ep_rews[stage])
 
+        tensor_obs = [torch.tensor(np.array(obs), dtype=torch.float) for obs in batch_obs]
+        tensor_acts = [torch.tensor(np.array(act), dtype=torch.float) for act in batch_acts]
+        tensor_log_probs = [torch.tensor(np.array(lp), dtype=torch.float) for lp in batch_log_probs]
 
-        # Reshape data as tensors in the shape specified before returning
-        # batch_obs = torch.tensor(batch_obs, dtype=torch.float)
-        # batch_acts = torch.tensor(batch_acts, dtype=torch.float)
-        # batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
-        
-        batch_obs = [torch.tensor(obs, dtype=torch.float) for obs in batch_obs]
-        batch_acts = [torch.tensor(act, dtype=torch.float) for act in batch_acts]
-        batch_log_probs = [torch.tensor(log_p, dtype=torch.float) for log_p in batch_log_probs]
+        batch_rtgs, batch_rets = self.compute_rtgs(batch_obs, batch_rews, batch_lens)
+        return tensor_obs, tensor_acts, tensor_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews
 
-        # print(batch_obs[0].shape, batch_acts[0].shape, batch_log_probs[0].shape) # torch.Size([500, 3, 1414]) torch.Size([500, 3, 28]) torch.Size([500, 3])
-        # raise NotImplementedError
-
-        # ALG STEP #4
-        batch_rtgs, batch_rets = self.compute_rtgs(batch_rews)
-        # self.logger['batch_rews'] = batch_rews
-        # self.logger['batch_lens'] = batch_lens
-
-        # Return the batch data
-        return batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens
-
-    def compute_rtgs(self,batch_rews):
+    def compute_rtgs(self, batch_obs, batch_rews, batch_lens):
         """
-        Calculate the Reward-To-Go of each timestep in a batch given the rewards
+        Calculates GAE-Lambda advantages and value targets,
+        augmented with AHO (Approximate Hypergradient Optimization) corrections.
         """
-        batch_rtgs = [[] for _ in stages] 
+        batch_rtgs = [[] for _ in stages]
         batch_rets = [[] for _ in stages]
         for stage in stages:
-            # print(np.array(batch_rews[stage]).shape) # (20, 500, 3)
-            batch_rtgs[stage], batch_rets[stage] = self._compute_rtgs(batch_rews[stage])
+            ep_ret_list = []
+            flat_rtg_list = []
+            raw_obs = np.array(batch_obs[stage])
+            if stage == LEADER:
+                norm_obs = self.leader_rms.normalize(raw_obs)
+            elif stage == BUYER:
+                norm_obs = self.buyer_rms.normalize(raw_obs)
+            else:
+                norm_obs = self.trans_rms.normalize(raw_obs)
+                
+            obs_tensor = torch.tensor(norm_obs, dtype=torch.float32)
+            num_episodes = len(batch_rews[stage])
+            
+            with torch.no_grad():
+                if stage == LEADER:
+                    V = self.leader_agent.critic(obs_tensor).squeeze(-1)
+                elif stage == BUYER:
+                    V = torch.stack([self.buyer_agents[ag].critic(obs_tensor[:, ag, :]).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+                else:
+                    V = torch.stack([self.trans_agents[ag].critic(obs_tensor[:, ag, :]).squeeze(-1) for ag in range(self.num_agents)], dim=-1)
+            
+            V = V.cpu().numpy()
+            V_episodes = []
+            curr_idx = 0
+            for ep_len_val in batch_lens:
+                V_episodes.append(V[curr_idx:curr_idx + ep_len_val])
+                curr_idx += ep_len_val
+            
+            for ep in range(num_episodes):
+                rews = np.array(batch_rews[stage][ep])
+                vals = V_episodes[ep]
+                advantages = np.zeros_like(rews)
+                gae = np.zeros_like(rews[0])
+                for t in reversed(range(len(rews))):
+                    next_val = vals[t+1] if t + 1 < len(rews) else np.zeros_like(rews[0])
+                    delta = rews[t] + self.gamma * next_val - vals[t]
+                    gae = delta + self.gamma * 0.95 * gae
+                    advantages[t] = gae
+                rtg = advantages + vals
+                flat_rtg_list.extend(rtg)
+                ep_ret_list.append(rtg[0])
+                
+            batch_rtgs[stage] = torch.tensor(np.array(flat_rtg_list), dtype=torch.float)
+            batch_rets[stage] = np.mean(ep_ret_list, axis=0)
+
+        # Apply AHO (Approximate Hypergradient Optimization) Correction to Leader returns
+        if self.use_aho:
+            num_episodes = len(batch_rews[LEADER])
+            
+            ep_aho_corrections = []
+            for ep in range(num_episodes):
+                buyer_rews = np.array(batch_rews[BUYER][ep])       # Shape: (T, num_agents)
+                trans_rews = np.array(batch_rews[TRANSFORM][ep])   # Shape: (T, num_agents)
+                follower_sum_rews = buyer_rews + trans_rews       # Total follower performance (T, num_agents)
+                
+                T_len = follower_sum_rews.shape[0]
+                S_nt = np.zeros_like(follower_sum_rews)
+                
+                running_sum = np.zeros_like(follower_sum_rews[0])
+                for t in reversed(range(T_len)):
+                    running_sum = follower_sum_rews[t] + self.gamma_aho * running_sum
+                    S_nt[t] = running_sum
+                    
+                ep_aho_corrections.append(S_nt)
+            
+            flat_S_nt = np.concatenate(ep_aho_corrections, axis=0) # Shape: (total_steps, num_agents)
+            mean_S_nt = np.mean(flat_S_nt, axis=0, keepdims=True)  # Batch advantage baseline (1, num_agents)
+            
+            aho_advantages = flat_S_nt - mean_S_nt
+            
+            # Map into Leader RTGs: Leader_RTG_t = Leader_RTG_t + (1/tau) * sum_n(S_{n,t} - mean_n)
+            aho_scalar_penalty = torch.tensor(np.sum(aho_advantages, axis=1), dtype=torch.float32)
+            
+            # Direct addition of the scalar surrogate gradient w.r.t phi
+            batch_rtgs[LEADER] = batch_rtgs[LEADER] + (1.0 / self.tau) * aho_scalar_penalty.unsqueeze(-1)
 
         return batch_rtgs, batch_rets
 
-    def _compute_rtgs(self,batch_rews):
-
-        batch_rtgs = []
-
-        batch_shape = len(batch_rews[0])*len(batch_rews) # len(ep_rew)*num_episodes
-        # Iterate through each episode backwards to maintain same order in batch_rtgs
-
-
-        for ep_rews in reversed(batch_rews):
-            s  = []
-            for i in range(self.num_agents):
-                s.append(0.0)
-            discounted_reward = np.array(s).reshape(batch_rews[0][0].shape) # The discounted reward so far
-            ep_rtgs = []
-            cumu_ret = 0
-            for rew in reversed(ep_rews):
-                discounted_reward = rew + discounted_reward *self.gamma
-                ep_rtgs.insert(0, discounted_reward)
-            batch_rtgs.append(ep_rtgs)
-            # print(ep_rtgs[0])
-            cumu_ret += np.array(ep_rtgs[0])
-
-        batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float).reshape(batch_shape,self.num_agents)
-        return batch_rtgs, cumu_ret / float(len(batch_rews))
-
     def learn(self):
+        t_so_far = 0
+        i_so_far = 0
 
-        #print(f"Learning... Running {self.episode_length} timesteps per episode, ", end='')
-        #print(f"{self.num_steps} timesteps per batch for a total of {total_timesteps} timesteps")
-        total_timesteps = self.num_steps*self.num_epochs
-        t_so_far = 0 # Timesteps simulated so far
-        i_so_far = 0 # Batches simulated so far
-
-        while t_so_far < total_timesteps:
-            self.logger.info('=================================================================')
-            score_AM = AverageMeter()
-            loss_AM = AverageMeter()
-
-            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens = self.rollout()
-
-            t_so_far += np.sum(batch_lens)
-
+        while i_so_far < self.num_epochs:
+            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_rets, batch_lens, batch_active_phi, batch_rews = self.rollout()
+            t_so_far += 1000  
             i_so_far += 1
 
-            curr_epoch_results_dict = {}
+            ent_coef = max(0.005, 0.05 * (0.95 ** i_so_far))
 
-            #self.logger['t_so_far'] = t_so_far
-            #self.logger['i_so_far'] = i_so_far
+            raw_obs_buyer = batch_obs[BUYER].cpu().numpy()
+            self.buyer_rms.update(raw_obs_buyer)
+            norm_obs_buyer = torch.tensor(self.buyer_rms.normalize(raw_obs_buyer), dtype=torch.float32).to(batch_obs[BUYER].device)
+
+            raw_obs_trans = batch_obs[TRANSFORM].cpu().numpy()
+            self.trans_rms.update(raw_obs_trans)
+            norm_obs_trans = torch.tensor(self.trans_rms.normalize(raw_obs_trans), dtype=torch.float32).to(batch_obs[TRANSFORM].device)
 
             for ag in range(self.num_agents):
-                for stage in stages:
-                    a_loss, c_loss = self.agent_pool.learn(batch_obs, batch_acts, batch_log_probs, batch_rtgs,\
-                            stage, ag, self.n_updates_per_iteration)
-                    # print(a_loss, c_loss)
-                    self.writer.add_scalar('actor_loss_stage_{}_agent_{}'.format(stage, ag), a_loss, t_so_far)
-                    self.writer.add_scalar('critic_loss_stage_{}_agent_{}'.format(stage, ag), c_loss, t_so_far)
-                    self.writer.add_scalar('return_stage_{}_agent_{}'.format(stage, ag), batch_rets[stage][ag], t_so_far)
-                if i_so_far % self.save_freq == 0:
-                    self.logger.info("Saving trained_model")
-                    self.agent_pool.save_model(stage, ag, f'ppo_actor_agent{ag+1}_{i_so_far}.pth')
+                a_loss_b, c_loss_b = self.buyer_agents[ag].learn(
+                    norm_obs_buyer[:, ag], batch_acts[BUYER][:, ag], 
+                    batch_log_probs[BUYER][:, ag], batch_rtgs[BUYER][:, ag], 10, entropy_coef=ent_coef
+                )
+                self.writer.add_scalar(f'buyer_actor_loss_agent_{ag}', a_loss_b, t_so_far)
+                self.writer.add_scalar(f'buyer_critic_loss_agent_{ag}', c_loss_b, t_so_far)
 
-            self.logger.info("Epoch {:3d}/{:3d}]".format(i_so_far, self.num_epochs))
+                a_loss_t, c_loss_t = self.trans_agents[ag].learn(
+                    norm_obs_trans[:, ag], batch_acts[TRANSFORM][:, ag], 
+                    batch_log_probs[TRANSFORM][:, ag], batch_rtgs[TRANSFORM][:, ag], 10, entropy_coef=ent_coef
+                )
+                self.writer.add_scalar(f'trans_actor_loss_agent_{ag}', a_loss_t, t_so_far)
+                self.writer.add_scalar(f'trans_critic_loss_agent_{ag}', c_loss_t, t_so_far)
 
-            #dumping result nd arrays
-            curr_epoch_results_dict['actual_d'] = self.env.actual_d
-            curr_epoch_results_dict['spot_q'] = self.env.spot_q
-            curr_epoch_results_dict['price'] = self.env.price
-            curr_epoch_results_dict['spot_price'] = self.env.spot_price
-            curr_epoch_results_dict['inv'] = self.env.inv
-            curr_epoch_results_dict['rewards'] = np.sum(np.array(batch_rets), axis=(0))
-            curr_epoch_results_dict['u_eco'] = self.env.eco_u
-            curr_epoch_results_dict['u_tx'] = self.env.tx_u
-            curr_epoch_results_dict['wastewater'] = self.env.wastewater
+            flat_active_phi = torch.tensor(np.array(batch_active_phi), dtype=torch.float32).reshape(-1, self.leader_act_dim).to(batch_obs[BUYER].device)
+            for ag in range(self.num_agents):
+                flat_state_norm = norm_obs_buyer[:, ag]
+                estimator_input = torch.cat([flat_active_phi, flat_state_norm], dim=-1)
+                target_returns = batch_rtgs[BUYER][:, ag]
+                loss_est = self.best_response_estimators[ag].update(estimator_input, target_returns)
+                self.writer.add_scalar(f'best_response_est_loss_agent_{ag}', loss_est, t_so_far)
 
-            #import pdb; pdb.set_trace()
+            if i_so_far % self.leader_update_frequency == 0:
+                penalties = []
+                for ag in range(self.num_agents):
+                    flat_state_norm = norm_obs_buyer[:, ag]
+                    estimator_input = torch.cat([flat_active_phi, flat_state_norm], dim=-1)
+                    v_star = self.best_response_estimators[ag](estimator_input).squeeze().detach()
+                    v_actual = batch_rtgs[BUYER][:, ag]
+                    penalties.append(v_star - v_actual)
+                
+                total_penalty = torch.stack(penalties, dim=0).mean(dim=0).unsqueeze(-1).detach()
+                clamped_penalty = torch.clamp(total_penalty, min=-10.0, max=10.0)
+                penalized_rtgs = batch_rtgs[LEADER] - self.lambda_penalty * clamped_penalty
 
-            np.save(str(debug_folder) + "/epoch={}_results.npy".format(i_so_far), curr_epoch_results_dict)
+                raw_obs_leader = batch_obs[LEADER].cpu().numpy()
+                self.leader_rms.update(raw_obs_leader)
+                norm_obs_leader = torch.tensor(self.leader_rms.normalize(raw_obs_leader), dtype=torch.float32).to(batch_obs[LEADER].device)
 
-            #import pdb; pdb.set_trace()
+                a_loss_l, c_loss_l = self.leader_agent.learn(
+                    norm_obs_leader, batch_acts[LEADER], 
+                    batch_log_probs[LEADER], penalized_rtgs, 10, entropy_coef=ent_coef
+                )
+                self.writer.add_scalar('leader_actor_loss', a_loss_l, t_so_far)
+                self.writer.add_scalar('leader_critic_loss', c_loss_l, t_so_far)
 
-
-            #import pdb; pdb.set_trace()
-
-
-
-
-
-        self.logger.info(" *** Training Done *** ")
-
-    ## TODO-Revise
-    # def _log_summary(self,ag):
-
-    #     delta_t = self.logger['delta_t']
-    #     self.logger['delta_t'] = time.time_ns()
-    #     delta_t = (self.logger['delta_t'] - delta_t) / 1e9
-    #     delta_t = str(round(delta_t, 2))
-
-    #     t_so_far = self.logger['t_so_far']
-    #     i_so_far = self.logger['i_so_far']
-    #     avg_ep_lens = np.mean(self.logger['batch_lens'])
-    #     ## TODO-Revise
-    #     #avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in np.array(self.logger['batch_rews'])[:,:,ag,:]])
-    #     #avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses'][f'agent{ag+1}']])
-    #     #self.logger['avg_batch_rews'][f'agent{ag+1}'].append(avg_ep_rews)
-    #     #self.logger['avg_actor_losses'][f'agent{ag+1}'].append(avg_actor_loss)
-    #     avg_ep_lens = str(round(avg_ep_lens, 2))
-    #     #avg_ep_rews = str(round(avg_ep_rews, 2))
-    #     #avg_actor_loss = str(round(avg_actor_loss, 5))
-
-    #     print(flush=True)
-    #     print(f"-------------------- Iteration #{i_so_far} --------------------", flush=True)
-    #     print(f"Displaying the stats for the agent: {ag+1}", flush = True)
-    #     print(f"Average Episodic Length: {avg_ep_lens}", flush=True)
-    #     # print(f"Average Episodic Return: {avg_ep_rews}", flush=True)
-    #     # print(f"Average Loss: {avg_actor_loss}", flush=True)
-    #     print(f"Timesteps So Far: {t_so_far}", flush=True)
-    #     print(f"Iteration took: {delta_t} secs", flush=True)
-    #     print(f"------------------------------------------------------", flush=True)
-    #     print(flush=True)
-    #     ## TODO-Revise
-    #     #self.logger['actor_losses'][f'agent{ag+1}'] = []
+            self.writer.add_scalar('leader_avg_return', np.mean(batch_rets[LEADER]), t_so_far)
+            self.writer.add_scalar('buyer_avg_return', np.mean(batch_rets[BUYER]), t_so_far)
+            self.writer.add_scalar('trans_avg_return', np.mean(batch_rets[TRANSFORM]), t_so_far)
+            
+            print(f"Epoch {i_so_far}/{self.num_epochs} Done. Leader Return: {np.mean(batch_rets[LEADER]):.5f}")
+            raw_leader_return = np.mean([np.sum(ep) for ep in batch_rews[LEADER]])
+            
+            curr_epoch_results_dict = {
+                'actual_d': self.env.actual_d,
+                'waste_actual_d': self.env.waste_actual_d,
+                'spot_q': self.env.spot_q,
+                'inv': self.env.inv,
+                'waste_inv': self.env.waste_inv,
+                'raw_leader_return': raw_leader_return,
+                'buyer_avg_return': np.mean(batch_rets[BUYER]),
+                'trans_avg_return': np.mean(batch_rets[TRANSFORM])
+            }
+            np.save(f"{self.debug_folder}/epoch={i_so_far}_results.npy", curr_epoch_results_dict)
